@@ -30,20 +30,20 @@ const int samples = 5;             // Sampel untuk rata-rata
 #define LOAD_PIN  15
 #define WIFI_LED_PIN 4
 
-// AP sementara untuk konfigurasi
+// AP sementara untuk konfigurasi (SEPERTI KODE SEBELUMNYA)
 const char* ap_ssid     = "GrainDryer_AP_5";
-const char* ap_password = "12345678"; // minimal 8 karakter
+const char* ap_password = "12345678"; // min 8 char
 
 // Panel ID (tetap 5 untuk unit ini)
 const int panelId = 5;
 
-// MQTT broker (tetap sesuai proyek Anda)
+// MQTT broker
 const char* mqttBroker = "broker.hivemq.com";
 const int   mqttPort   = 1883;
 
 // ================== Globals ==================
 
-Adafruit_MAX31865 rtd(RTD_CS); // pakai VSPI global pin di atas
+Adafruit_MAX31865 rtd(RTD_CS);
 
 Preferences prefs;
 WebServer server(80);
@@ -86,14 +86,10 @@ String getMac() {
 }
 
 void startApForConfig() {
-  // Hindari perubahan NVS & sleep wifi untuk kestabilan AP
-  WiFi.persistent(false);
-  WiFi.setSleep(false);
-
+  // === PERSIS SEPERTI KODE LAMA ===
   WiFi.mode(WIFI_AP);
-  // Channel=1, hidden=0, maxconn=4 untuk kompatibilitas Android
   WiFi.softAPConfig(IPAddress(192,168,4,1), IPAddress(192,168,4,1), IPAddress(255,255,255,0));
-  WiFi.softAP(ap_ssid, ap_password, 1, 0, 4);
+  WiFi.softAP(ap_ssid, ap_password);
   apActive = true;
 
   Serial.print("AP Started at ");
@@ -103,26 +99,22 @@ void startApForConfig() {
 void stopApIfAllowed() {
   if (!apActive) return;
 
-  // Hanya matikan AP jika provisioning + MQTT + publish CONNECT sudah OK
+  // Matikan AP hanya jika: sudah configured + STA connected + MQTT connected + CONNECT publish sukses
   if (prefs.getBool("configured", false) &&
       WiFi.status() == WL_CONNECTED &&
       mqttClient.connected() &&
       connectEventPublished) {
 
-    bool stopped = WiFi.softAPdisconnect(true);
-    if (stopped) {
-      Serial.println("AP stopped (softAPdisconnect).");
-    }
+    WiFi.softAPdisconnect(true);
     if (WiFi.getMode() == WIFI_AP || WiFi.getMode() == WIFI_AP_STA) {
       WiFi.mode(WIFI_STA);
-      Serial.println("Switched WiFi mode to WIFI_STA.");
     }
     apActive = false;
+    Serial.println("AP stopped (provisioning & MQTT done).");
   }
 }
 
 void maybeStopApAfterProvisioned() {
-  // dipanggil setelah CONNECT publish dan juga di loop()
   stopApIfAllowed();
 }
 
@@ -148,7 +140,6 @@ void handleConfig() {
   DynamicJsonDocument doc(768);
   DeserializationError err = deserializeJson(doc, body);
 
-  // Kontrak sama dengan perangkat pertama:
   // Wajib: ssid, pass, dryer_id, mitra_id, location, device_name, mqtt_topic_base
   if (!err &&
       doc.containsKey("ssid") &&
@@ -220,24 +211,24 @@ void callback(char* topic, byte* payload, unsigned int length) {
   if (t == resetWifiTopic && msg == "reset") {
     Serial.println("Received resetWiFi command. Clearing prefs & topics, shutting down WiFi & MQTT...");
 
-    // Kosongkan runtime topics agar aman
+    // Kosongkan runtime topics
     mqttBase = "";
     telemetryTopic = "";
     resetWifiTopic = "";
     connectTopic = "";
     connectEventPublished = false;
 
-    // Hentikan MQTT jika sedang connect
+    // Hentikan MQTT jika connect
     if (mqttClient.connected()) {
       mqttClient.disconnect();
     }
 
-    // Bersihkan NVS seluruhnya (termasuk 'configured' & topik)
+    // Bersihkan NVS (termasuk 'configured')
     prefs.clear();
 
-    // Putus WiFi (hapus konfigurasi STA, matikan AP)
+    // Putus WiFi (AP & STA)
     WiFi.softAPdisconnect(true);
-    WiFi.disconnect(true, true); // wifioff=true, erase ap config=true
+    WiFi.disconnect(true, true);
     WiFi.mode(WIFI_OFF);
     apActive = false;
 
@@ -319,8 +310,8 @@ bool publishConnectEvent() {
   bool ok = mqttClient.publish(connectTopic.c_str(), (uint8_t*)buf.get(), n, true);
   if (ok) {
     Serial.println(String("CONNECT event published: ") + String(buf.get()));
-    connectEventPublished = true;             // <— tandai sukses publish
-    maybeStopApAfterProvisioned();            // <— evaluasi mematikan AP
+    connectEventPublished = true;   // ← tandai sukses
+    maybeStopApAfterProvisioned();  // ← evaluasi matikan AP
   } else {
     Serial.println("Failed to publish CONNECT event");
   }
@@ -391,7 +382,7 @@ void setup() {
   prefs.begin("wifi", false);
   setupTopicsFromPrefs();
 
-  // AP always on for config (baru dimatikan setelah MQTT + CONNECT sukses)
+  // AP always on for config (MATI kalau provisioning + MQTT sukses)
   startApForConfig();
 
   server.on("/", HTTP_GET, handleRoot);
@@ -409,8 +400,6 @@ void setup() {
 
     // Jalankan STA TANPA mematikan AP
     WiFi.mode(WIFI_AP_STA);
-    WiFi.persistent(false);
-    WiFi.setSleep(false);
     WiFi.begin(ssid.c_str(), pass.c_str());
 
     unsigned long t0 = millis();
@@ -426,7 +415,7 @@ void setup() {
       mqttClient.setBufferSize(1024);
       mqttClient.setKeepAlive(30);
 
-      connectMQTT();                  // CONNECT publish di sini akan memicu evaluasi stop AP
+      connectMQTT(); // CONNECT publish → evaluasi stop AP
     } else {
       Serial.println("\nWiFi Failed; AP continues for config");
     }
@@ -473,7 +462,7 @@ float getBurningTemp() {
   delay(65);
 
   uint16_t raw = rtd.readRTD();
-  (void)raw; // tidak dipakai langsung di sini
+  (void)raw;
 
   float tC = rtd.temperature(RNOMINAL, RREF);
   rtd.enableBias(false);
@@ -576,7 +565,7 @@ void loop() {
 
   server.handleClient();
 
-  // Jangan matikan AP di sini kecuali semua syarat provisioning terpenuhi
+  // Evaluasi mematikan AP hanya bila semua syarat terpenuhi
   maybeStopApAfterProvisioned();
 
   if (WiFi.status() == WL_CONNECTED && !mqttClient.connected()) {
