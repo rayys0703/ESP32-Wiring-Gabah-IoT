@@ -60,7 +60,7 @@ String telemetryTopic;     // {mqttBase}/{panelId}
 String resetWifiTopic;     // {mqttBase}/resetwifi/{panelId}
 String connectTopic;       // {mqttBase}/{panelId}/connect
 
-// Seven-seg common anode patterns (7 bit + DP)
+// Seven-seg common anode patterns (7 bit + DP, low=lit, original logic)
 const byte digitPatterns[11] = {
   B1000000, B1111001, B0100100, B0110000, B0011001,
   B0010010, B0000010, B1111000, B0000000, B0010000, B1111111
@@ -462,31 +462,50 @@ void publishSensorData() {
   }
 }
 
-// Extract 2 integer digits + 1 decimal for seven-seg
+// Extract digits for seven-seg with support for >99.9 and <0 (original logic extended)
 void extractDigits(float value, byte* digits) {
-  if (value < 0) value = 0;
-  if (value > 99.9) value = 99.9;
+  if (value < 0) {
+    value = 0;
+  } else if (value > 999) {
+    value = 999;
+  }
+
   int intPart = (int)value;
-  int decPart = (int)((value - intPart) * 10);
-  digits[0] = (intPart / 10) % 10;
-  digits[1] = intPart % 10;
-  digits[2] = decPart;
+  int decPart = (int)round((value - intPart) * 10);
+
+  if (intPart >= 100) {
+    // Tampil XXX tanpa desimal
+    digits[0] = (intPart / 100) % 10; // ratusan (left)
+    digits[1] = (intPart / 10) % 10;  // puluhan (middle)
+    digits[2] = intPart % 10;         // satuan (right)
+  } else {
+    // Tampil XX.X dengan desimal
+    digits[0] = (intPart / 10) % 10;  // puluhan (left)
+    digits[1] = intPart % 10;         // satuan (middle)
+    digits[2] = decPart;              // desimal (right)
+  }
 }
 
-// Display burning temp on 3-digit module
+// Display burning temp on 3-digit module (original logic: shift right first, DP on middle for decimal mode)
 void displayOnSevenSegment() {
   byte digits[3];
   extractDigits(globalBurningTemp, digits);
 
-  byte displayData[3];
-  displayData[0] = digitPatterns[digits[0]]; // puluhan
-  displayData[1] = digitPatterns[digits[1]]; // satuan (DP on)
-  displayData[2] = digitPatterns[digits[2]]; // desimal
+  bool showDecimal = (globalBurningTemp < 100); // Decimal mode if <100
 
+  byte displayData[3];
+  displayData[0] = digitPatterns[digits[0]]; // left
+  displayData[1] = digitPatterns[digits[1]]; // middle
+  displayData[2] = digitPatterns[digits[2]]; // right
+
+  // Shift out right to left (original order for chain)
   for (int i = 2; i >= 0; i--) {
     byte dataToSend = displayData[i] & B01111111;
-    if (i == 1) dataToSend |= B00000000;  // DP on
-    else        dataToSend |= B10000000;  // DP off
+    if (showDecimal && i == 1) {
+      dataToSend |= B00000000;  // DP on (bit7=0)
+    } else {
+      dataToSend |= B10000000;  // DP off (bit7=1)
+    }
     shiftOut(SDI_PIN, SCLK_PIN, MSBFIRST, dataToSend);
   }
 
@@ -533,17 +552,18 @@ void loop() {
   if (now - lastUpdate >= 1000) {
     float current = readACCurrentValue();
     globalStirrerStatus = (current > currentThreshold);
-    globalBurningTemp   = getBurningTemp();
 
-    // Serial.print("\nArus: ");
-    // Serial.print(current, 2);
-    // Serial.println(" A");
-    // Serial.print("Suhu Pembakaran: ");
-    // Serial.print(globalBurningTemp, 2);
-    // Serial.println(" C");
-    // Serial.print("Status Pengaduk: ");
-    // Serial.println(globalStirrerStatus ? "True" : "False");
-    // Serial.println("-----------");
+    globalBurningTemp = getBurningTemp(); // Mengambil suhu dari sensor
+
+    Serial.print("\nArus: ");
+    Serial.print(current, 2);
+    Serial.println(" A");
+    Serial.print("Suhu Pembakaran: ");
+    Serial.print(globalBurningTemp, 2);
+    Serial.println(" C");
+    Serial.print("Status Pengaduk: ");
+    Serial.println(globalStirrerStatus ? "True" : "False");
+    Serial.println("-----------");
 
     displayOnSevenSegment();
     lastUpdate = now;
