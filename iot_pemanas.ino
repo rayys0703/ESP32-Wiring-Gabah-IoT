@@ -70,6 +70,9 @@ unsigned long wifiLedPreviousMillis = 0;
 const long wifiLedInterval = 500; // blink 500ms
 bool wifiLedState = LOW;
 
+// Track status AP
+bool apRunning = false;
+
 // ================== Utils ==================
 
 String getMac() {
@@ -81,25 +84,25 @@ String getMac() {
   return String(buf);
 }
 
-// Start AP untuk provisioning (dipanggil hanya saat perlu)
-void startConfigAP() {
-  WiFi.mode(WIFI_AP);
+void startAP() {
+  if (apRunning) return;
+  WiFi.mode(WIFI_AP); // hanya AP
   WiFi.softAPConfig(IPAddress(192,168,4,1), IPAddress(192,168,4,1), IPAddress(255,255,255,0));
   WiFi.softAP(ap_ssid, ap_password);
+  apRunning = true;
   Serial.print("AP Started at ");
   Serial.println(WiFi.softAPIP());
-  Serial.println("HTTP server started at http://192.168.4.1");
 }
 
-// Matikan AP jika sedang aktif (dipanggil setelah STA connected)
 void stopAPIfRunning() {
-  if (WiFi.getMode() & WIFI_AP) {
-    Serial.println("Disabling AP (softAPdisconnect)...");
-    WiFi.softAPdisconnect(true);
-    // Pastikan mode bersih ke STA saja jika sudah terhubung
-    if (WiFi.status() == WL_CONNECTED) {
-      WiFi.mode(WIFI_STA);
-    }
+  if (!apRunning) return;
+  Serial.println("Stopping AP (hotspot)...");
+  WiFi.softAPdisconnect(true); // matikan AP & hapus SSID
+  apRunning = false;
+
+  // Jika STA sudah tersetup, pindah ke WIFI_STA, kalau belum biarkan mode sekarang
+  if (WiFi.status() == WL_CONNECTED) {
+    WiFi.mode(WIFI_STA);
   }
 }
 
@@ -195,13 +198,13 @@ void callback(char* topic, byte* payload, unsigned int length) {
   Serial.println("MQTT MSG on " + t + ": " + msg);
 
   if (t == resetWifiTopic && msg == "reset") {
-    Serial.println("Received resetWiFi command. Clearing prefs & topics...");
-    // Hapus semua konfigurasi (termasuk topic & flag configured)
+    Serial.println("Received resetWiFi command. Clearing prefs...");
+    // Hapus SEMUA data NVS, termasuk topik mqtt & flag configured
     prefs.clear();
-    // Putus WiFi STA & AP
-    WiFi.disconnect(true, true);
-    WiFi.softAPdisconnect(true);
-    Serial.println("Restarting to AP provisioning mode...");
+    WiFi.disconnect(true);
+    // Jika AP kebetulan masih nyala, matikan dulu (tidak wajib karena restart)
+    stopAPIfRunning();
+    Serial.println("Restarting to AP mode...");
     delay(200);
     ESP.restart();
   }
@@ -320,7 +323,7 @@ void connectMQTT() {
       delay(300);
     }
 
-    // === Matikan AP setelah MQTT siap (agar SSID AP tidak muncul terus) ===
+    // ==== Matikan AP jika MQTT sudah connected ====
     stopAPIfRunning();
 
   } else {
@@ -356,23 +359,19 @@ void setup() {
   prefs.begin("wifi", false);
   setupTopicsFromPrefs();
 
-  // HTTP server (selalu aktif agar bisa /config saat AP menyala)
+  // Siapkan WebServer (bisa diakses saat AP atau saat STA punya IP)
   server.on("/", HTTP_GET, handleRoot);
   server.on("/config", HTTP_POST, handleConfig);
   server.onNotFound(handleNotFound);
   server.begin();
+  Serial.println("HTTP server started (AP/STA).");
 
+  // Koneksi WiFi:
   bool configured = prefs.getBool("configured", false);
   String ssid = prefs.getString("ssid", "");
 
-  if (!configured) {
-    // Belum dikonfigurasi → hanya AP untuk provisioning
-    startConfigAP();
-    return;
-  }
-
-  // Sudah dikonfigurasi → coba konek STA saja (tanpa AP)
-  if (ssid.length() > 0) {
+  if (configured && ssid.length() > 0) {
+    // Coba STA saja dulu (tanpa AP) agar SSID AP tidak selalu muncul
     String pass = prefs.getString("pass", "");
     Serial.printf("Connecting to %s...\n", ssid.c_str());
 
@@ -392,15 +391,14 @@ void setup() {
       mqttClient.setKeepAlive(30);
 
       connectMQTT();
-      // Pastikan AP padam (kalau sebelumnya pernah aktif)
-      stopAPIfRunning();
+      // AP TIDAK dinyalakan di path ini
     } else {
-      Serial.println("\nWiFi Failed; enabling AP for provisioning");
-      startConfigAP(); // fallback ke AP jika STA gagal
+      Serial.println("\nWiFi Failed; enabling AP for config");
+      startAP();
     }
   } else {
-    // configured tapi SSID kosong → aktifkan AP supaya user isi lagi
-    startConfigAP();
+    // Belum dikonfigurasi → nyalakan AP untuk provisioning
+    startAP();
   }
 }
 
@@ -552,6 +550,11 @@ void loop() {
     connectMQTT();
   }
   mqttClient.loop();
+
+  // Jika STA sudah konek & AP masih nyala, matikan AP (jaga-jaga)
+  if (WiFi.status() == WL_CONNECTED && apRunning) {
+    stopAPIfRunning();
+  }
 
   // Update sensor tiap 1 detik
   if (now - lastUpdate >= 1000) {
