@@ -70,10 +70,6 @@ unsigned long wifiLedPreviousMillis = 0;
 const long wifiLedInterval = 500; // blink 500ms
 bool wifiLedState = LOW;
 
-// Track status AP & server
-bool apRunning = false;
-bool serverStarted = false;
-
 // ================== Utils ==================
 
 String getMac() {
@@ -85,53 +81,25 @@ String getMac() {
   return String(buf);
 }
 
-void startApForConfig() {
-  if (apRunning) return;
+// Start AP untuk provisioning (dipanggil hanya saat perlu)
+void startConfigAP() {
   WiFi.mode(WIFI_AP);
   WiFi.softAPConfig(IPAddress(192,168,4,1), IPAddress(192,168,4,1), IPAddress(255,255,255,0));
   WiFi.softAP(ap_ssid, ap_password);
-  apRunning = true;
-
-  if (!serverStarted) {
-    server.on("/", HTTP_GET, [](){
-      Serial.println("Received GET /");
-      server.send(200, "text/html",
-        "<!DOCTYPE html><html><body><h2>ESP32 GrainDryer</h2><p>POST /config untuk WiFi</p></body></html>");
-    });
-    server.on("/config", HTTP_POST, [](){ /* placeholder, dihandle di handleConfig() */ });
-    // ganti handler /config ke fungsi sebenarnya
-    server.removeHandler(server._currentHandler); // pastikan tidak dobel
-    server.on("/config", HTTP_POST, [](){ /* akan di-override */ });
-    // Karena WebServer tidak expose removeHandler publik di semua core,
-    // kita cukup daftarkan handler final di setup() (lihat di bawah).
-    // Di sini biarkan minimal.
-    server.onNotFound([](){
-      Serial.println("Received request for unknown endpoint: " + server.uri());
-      server.send(404, "text/plain", "File not found");
-    });
-    server.begin();
-    serverStarted = true;
-  }
-
   Serial.print("AP Started at ");
   Serial.println(WiFi.softAPIP());
   Serial.println("HTTP server started at http://192.168.4.1");
 }
 
-void stopApIfRunning() {
-  if (!apRunning) return;
-  Serial.println("Stopping AP (switching to STA only)...");
-  WiFi.softAPdisconnect(true);
-  WiFi.mode(WIFI_STA);
-  apRunning = false;
-
-  // Opsional: hentikan server konfigurasi agar tidak bisa diakses via STA
-  if (serverStarted) {
-#if ARDUINO >= 0x10600
-    server.stop();
-#endif
-    serverStarted = false;
-    Serial.println("Config HTTP server stopped.");
+// Matikan AP jika sedang aktif (dipanggil setelah STA connected)
+void stopAPIfRunning() {
+  if (WiFi.getMode() & WIFI_AP) {
+    Serial.println("Disabling AP (softAPdisconnect)...");
+    WiFi.softAPdisconnect(true);
+    // Pastikan mode bersih ke STA saja jika sudah terhubung
+    if (WiFi.status() == WL_CONNECTED) {
+      WiFi.mode(WIFI_STA);
+    }
   }
 }
 
@@ -219,13 +187,6 @@ void handleNotFound() {
 
 // ================== MQTT ==================
 
-void clearAllConfigInRam() {
-  mqttBase = "";
-  telemetryTopic = "";
-  resetWifiTopic = "";
-  connectTopic = "";
-}
-
 void callback(char* topic, byte* payload, unsigned int length) {
   String t = String(topic);
   String msg;
@@ -235,18 +196,12 @@ void callback(char* topic, byte* payload, unsigned int length) {
 
   if (t == resetWifiTopic && msg == "reset") {
     Serial.println("Received resetWiFi command. Clearing prefs & topics...");
-    // Putus MQTT
-    if (mqttClient.connected()) mqttClient.disconnect();
-
-    // Hapus semua konfigurasi (termasuk topics & flag configured)
+    // Hapus semua konfigurasi (termasuk topic & flag configured)
     prefs.clear();
-    clearAllConfigInRam();
-
-    // Putus WiFi STA & matikan AP (akan nyala lagi saat boot di setup)
+    // Putus WiFi STA & AP
     WiFi.disconnect(true, true);
-    stopApIfRunning();
-
-    Serial.println("Restarting to AP-only mode...");
+    WiFi.softAPdisconnect(true);
+    Serial.println("Restarting to AP provisioning mode...");
     delay(200);
     ESP.restart();
   }
@@ -258,7 +213,10 @@ void setupTopicsFromPrefs() {
   bool configured = prefs.getBool("configured", false);
   if (!configured) {
     // Setelah resetwifi, biarkan kosong — tidak fallback topik default
-    clearAllConfigInRam();
+    mqttBase = "";
+    telemetryTopic = "";
+    resetWifiTopic = "";
+    connectTopic = "";
     Serial.println("NO CONFIG in NVS; topics not set");
     return;
   }
@@ -362,8 +320,8 @@ void connectMQTT() {
       delay(300);
     }
 
-    // === Matikan AP setelah WiFi+MQTT sukses ===
-    stopApIfRunning();
+    // === Matikan AP setelah MQTT siap (agar SSID AP tidak muncul terus) ===
+    stopAPIfRunning();
 
   } else {
     Serial.print("MQTT Failed, rc=");
@@ -398,46 +356,51 @@ void setup() {
   prefs.begin("wifi", false);
   setupTopicsFromPrefs();
 
-  // HTTP server routes (hanya aktif kalau AP dinyalakan)
+  // HTTP server (selalu aktif agar bisa /config saat AP menyala)
   server.on("/", HTTP_GET, handleRoot);
   server.on("/config", HTTP_POST, handleConfig);
   server.onNotFound(handleNotFound);
+  server.begin();
 
-  // === Mode WiFi ===
   bool configured = prefs.getBool("configured", false);
+  String ssid = prefs.getString("ssid", "");
+
   if (!configured) {
-    // Belum dikonfigurasi → AP-only untuk provisioning
-    startApForConfig();
-  } else {
-    // Sudah dikonfigurasi → coba STA saja
-    String ssid = prefs.getString("ssid", "");
+    // Belum dikonfigurasi → hanya AP untuk provisioning
+    startConfigAP();
+    return;
+  }
+
+  // Sudah dikonfigurasi → coba konek STA saja (tanpa AP)
+  if (ssid.length() > 0) {
     String pass = prefs.getString("pass", "");
-    if (ssid.length() > 0) {
-      Serial.printf("Connecting to %s...\n", ssid.c_str());
-      WiFi.mode(WIFI_STA);
-      WiFi.begin(ssid.c_str(), pass.c_str());
-      unsigned long t0 = millis();
-      while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) {
-        delay(500);
-        Serial.print(".");
-      }
-      if (WiFi.status() == WL_CONNECTED) {
-        Serial.println("\nWiFi Connected: " + WiFi.localIP().toString());
+    Serial.printf("Connecting to %s...\n", ssid.c_str());
 
-        mqttClient.setServer(mqttBroker, mqttPort);
-        mqttClient.setCallback(callback);
-        mqttClient.setBufferSize(1024);
-        mqttClient.setKeepAlive(30);
-
-        connectMQTT(); // ini akan memanggil stopApIfRunning() bila AP sempat aktif (tidak aktif di jalur ini)
-      } else {
-        Serial.println("\nWiFi Failed; enabling AP for reconfiguration");
-        startApForConfig(); // fallback supaya user bisa re-config
-      }
-    } else {
-      // Konfigurasi tidak lengkap → AP untuk provisioning
-      startApForConfig();
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid.c_str(), pass.c_str());
+    unsigned long t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) {
+      delay(500);
+      Serial.print(".");
     }
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("\nWiFi Connected: " + WiFi.localIP().toString());
+
+      mqttClient.setServer(mqttBroker, mqttPort);
+      mqttClient.setCallback(callback);
+      mqttClient.setBufferSize(1024);
+      mqttClient.setKeepAlive(30);
+
+      connectMQTT();
+      // Pastikan AP padam (kalau sebelumnya pernah aktif)
+      stopAPIfRunning();
+    } else {
+      Serial.println("\nWiFi Failed; enabling AP for provisioning");
+      startConfigAP(); // fallback ke AP jika STA gagal
+    }
+  } else {
+    // configured tapi SSID kosong → aktifkan AP supaya user isi lagi
+    startConfigAP();
   }
 }
 
@@ -582,7 +545,7 @@ void loop() {
   static unsigned long lastUpdate = 0;
   unsigned long now = millis();
 
-  if (serverStarted) server.handleClient();
+  server.handleClient();
 
   if (WiFi.status() == WL_CONNECTED && !mqttClient.connected()) {
     Serial.println("MQTT disconnected, trying reconnect...");
